@@ -49,14 +49,27 @@ const server = createServer((req, res) => {
     readJsonBody(req)
       .then(async (event) => {
         rememberOpenCodeMessageRole(event);
+        rememberOpenCodeQuestion(event);
         const texts = dedupeHookTexts(event, [
           ...extractAssistantText(event),
           ...(await extractTranscriptAssistantText(event)),
         ]);
+        const userTexts = dedupeUserConversationTexts(event, extractOpenCodeQuestionReplyTexts(event));
         const userId = resolveEventUserId(event);
         const projectId = resolveEventProjectId(event);
         const sessionId = getOpenCodeSessionId(event);
         const debug = rememberAgentEvent(event, texts, "hook");
+        for (const text of userTexts) {
+          void appendConversationMessage({
+            userId,
+            sessionId,
+            projectId,
+            role: "user",
+            content: text,
+            source: "terminal-selection",
+            eventType: String(event?.hook_event_name || event?.event_type || ""),
+          });
+        }
         for (const text of texts) {
           void appendConversationMessage({
             userId,
@@ -68,9 +81,9 @@ const server = createServer((req, res) => {
             eventType: String(event?.hook_event_name || event?.event_type || ""),
           });
         }
-        broadcastAgentEvent({ type: "hook", event, texts, debug, userId, projectId });
+        broadcastAgentEvent({ type: "hook", event, texts, userTexts, debug, userId, projectId });
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, texts: texts.length, debug }));
+        res.end(JSON.stringify({ ok: true, texts: texts.length, userTexts: userTexts.length, debug }));
       })
       .catch((error) => {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -229,10 +242,12 @@ async function attachPtyServer(httpServer) {
 
 const agentEventClients = new Set();
 const deliveredHookTexts = new Map();
+const deliveredUserConversationTexts = new Map();
 const recentAgentEvents = [];
 const recentAgentMessages = [];
 const processedAgentFiles = new Map();
 const openCodeMessageRoles = new Map();
+const openCodeQuestions = new Map();
 const openCodeSessionUsers = new Map();
 const openCodeSessionProjects = new Map();
 const activeUserCounts = new Map();
@@ -307,12 +322,13 @@ function broadcastAssistantText(text, source, userId = getCurrentConversationUse
       void appendConversationMessage({
         userId,
         sessionId: "opencode",
+        projectId,
         role: "assistant",
         content: normalizedText,
         source,
       });
     }
-    broadcastAgentEvent({ type: "hook", event, texts, debug, userId });
+    broadcastAgentEvent({ type: "hook", event, texts, debug, userId, projectId });
   }
 }
 
@@ -413,10 +429,23 @@ async function processAgentEventFile(filePath) {
 
     for (const event of events) {
       rememberOpenCodeMessageRole(event);
+      rememberOpenCodeQuestion(event);
       const texts = dedupeHookTexts(event, extractAssistantText(event));
+      const userTexts = dedupeUserConversationTexts(event, extractOpenCodeQuestionReplyTexts(event));
       const userId = resolveEventUserId(event);
       const projectId = resolveEventProjectId(event);
       const debug = rememberAgentEvent({ ...event, file_path: filePath }, texts, "file-watch");
+      for (const text of userTexts) {
+        void appendConversationMessage({
+          userId,
+          projectId,
+          sessionId: getOpenCodeSessionId(event),
+          role: "user",
+          content: text,
+          source: "terminal-selection",
+          eventType: String(event?.hook_event_name || event?.event_type || event?.event?.type || ""),
+        });
+      }
       for (const text of texts) {
         void appendConversationMessage({
           userId,
@@ -428,7 +457,7 @@ async function processAgentEventFile(filePath) {
           eventType: String(event?.hook_event_name || event?.event_type || event?.event?.type || ""),
         });
       }
-      broadcastAgentEvent({ type: "hook", event: { ...event, file_path: filePath }, texts, debug, userId, projectId });
+      broadcastAgentEvent({ type: "hook", event: { ...event, file_path: filePath }, texts, userTexts, debug, userId, projectId });
     }
   } catch (error) {
     rememberAgentEvent(
@@ -707,6 +736,10 @@ function normalizeTerminalChatInput(value) {
   return String(value).replace(/\r?\n$/, "").replace(/\r$/, "").trim();
 }
 
+function isPersistedUserConversationSource(source) {
+  return source === "chat-input" || source === "terminal-selection";
+}
+
 async function appendConversationMessage(message) {
   const content = String(message.content || "").trim();
 
@@ -714,7 +747,7 @@ async function appendConversationMessage(message) {
     return;
   }
 
-  if (message.role === "user" && message.source !== "chat-input") {
+  if (message.role === "user" && !isPersistedUserConversationSource(message.source)) {
     return;
   }
 
@@ -891,7 +924,7 @@ async function readUserConversationMessages(userId, projectId = "default") {
         continue;
       }
 
-      if (message.role === "user" && message.source !== "chat-input") {
+      if (message.role === "user" && !isPersistedUserConversationSource(message.source)) {
         continue;
       }
 
@@ -1057,6 +1090,42 @@ function dedupeHookTexts(event, texts) {
   }
 
   deliveredHookTexts.set(dedupeKey, delivered);
+  return next;
+}
+
+function dedupeUserConversationTexts(event, texts) {
+  const properties = event?.event?.properties;
+  const eventIdentity = String(properties?.requestID || properties?.id || event?.event?.id || event?.id || "user");
+  const dedupeKey = [
+    resolveEventUserId(event),
+    resolveEventProjectId(event),
+    getOpenCodeSessionId(event),
+    String(event?.event_type || event?.event?.type || "user"),
+    eventIdentity,
+  ].join(":");
+  const delivered = deliveredUserConversationTexts.get(dedupeKey) || new Map();
+  const next = [];
+  const now = Date.now();
+
+  for (const text of texts) {
+    const normalized = text.trim();
+    const lastDeliveredAt = delivered.get(normalized) || 0;
+
+    if (!normalized || now - lastDeliveredAt < 120000) {
+      continue;
+    }
+
+    delivered.set(normalized, now);
+    next.push(normalized);
+  }
+
+  for (const [text, deliveredAt] of delivered) {
+    if (now - deliveredAt > 120000) {
+      delivered.delete(text);
+    }
+  }
+
+  deliveredUserConversationTexts.set(dedupeKey, delivered);
   return next;
 }
 
@@ -1248,6 +1317,89 @@ function extractAssistantText(event) {
   }
 
   return collectTextFields(event).filter((text) => !isNoiseText(text));
+}
+
+function rememberOpenCodeQuestion(event) {
+  const eventType = String(event?.event_type || event?.event?.type || "").toLowerCase();
+
+  if (eventType !== "question.asked") {
+    return;
+  }
+
+  const properties = event?.event?.properties;
+  const requestId = typeof properties?.id === "string" ? properties.id : "";
+  const questions = Array.isArray(properties?.questions) ? properties.questions : [];
+
+  if (!requestId || !questions.length) {
+    return;
+  }
+
+  openCodeQuestions.set(requestId, questions);
+
+  if (openCodeQuestions.size > 200) {
+    const stale = Array.from(openCodeQuestions.keys()).slice(0, openCodeQuestions.size - 160);
+
+    for (const key of stale) {
+      openCodeQuestions.delete(key);
+    }
+  }
+}
+
+function extractOpenCodeQuestionReplyTexts(event) {
+  const eventType = String(event?.event_type || event?.event?.type || "").toLowerCase();
+
+  if (eventType !== "question.replied" && eventType !== "question.answered") {
+    return [];
+  }
+
+  const properties = event?.event?.properties;
+  const answers = Array.isArray(properties?.answers) ? properties.answers : [];
+
+  if (!answers.length) {
+    return [];
+  }
+
+  const requestId = typeof properties?.requestID === "string" ? properties.requestID : "";
+  const questions = requestId ? openCodeQuestions.get(requestId) || [] : [];
+  const selections = answers
+    .map((answer, index) => formatQuestionAnswer(answer, questions[index]))
+    .filter(Boolean);
+
+  if (!selections.length) {
+    return [];
+  }
+
+  return [`Selected: ${selections.join("; ")}`];
+}
+
+function formatQuestionAnswer(answer, question) {
+  const values = flattenQuestionAnswerValues(answer);
+
+  if (!values.length) {
+    return "";
+  }
+
+  const label = String(question?.header || question?.question || "").trim();
+  const value = values.join(", ");
+  return label ? `${label}: ${value}` : value;
+}
+
+function flattenQuestionAnswerValues(value) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => flattenQuestionAnswerValues(item));
+  }
+
+  if (typeof value === "object") {
+    const directValue = value.value ?? value.label ?? value.text ?? value.name ?? value.id;
+    return flattenQuestionAnswerValues(directValue);
+  }
+
+  const text = String(value).trim();
+  return text ? [text] : [];
 }
 
 function extractOpenCodeRawText(event) {

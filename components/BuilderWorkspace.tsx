@@ -274,6 +274,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
   const [terminalMessages, setTerminalMessages] = useState<TerminalConversationMessage[]>([]);
   const [hookStatus, setHookStatus] = useState<"connecting" | "connected" | "closed">("connecting");
   const [isChatReady, setIsChatReady] = useState(false);
+  const [isAwaitingModel, setIsAwaitingModel] = useState(false);
   const isOpenCodeConnected = hookStatus === "connected" && isChatReady;
   const isChatLoading = hookStatus === "connecting" || (hookStatus === "connected" && !isChatReady);
   const chatLoadingTitle = hookStatus === "connecting" ? "Agent is starting" : "Agent is getting ready";
@@ -542,6 +543,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
     setWorkspaceFiles([]);
     setFileTree([]);
     setTerminalMessages([]);
+    setIsAwaitingModel(false);
     setHookStatus("connecting");
     setActiveViewTab("code");
     setPreviewBootStatus("idle");
@@ -588,7 +590,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
     }
 
     feed.scrollTop = feed.scrollHeight;
-  }, [terminalMessages.length, isChatLoading]);
+  }, [terminalMessages.length, isChatLoading, isAwaitingModel]);
 
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -599,6 +601,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
         const payload = JSON.parse(event.data) as {
           type?: string;
           texts?: string[];
+          userTexts?: string[];
           data?: string;
           debug?: AgentHookDebug;
         };
@@ -610,7 +613,12 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
         const incomingTexts = payload.texts?.length ? payload.texts : payload.debug?.textPreview || [];
 
         if (incomingTexts.length) {
+          setIsAwaitingModel(false);
           appendAgentMessages(incomingTexts, payload.debug);
+        }
+
+        if (payload.userTexts?.length) {
+          appendUserMessages(payload.userTexts);
         }
       } catch {
         // Ignore non-hook websocket frames.
@@ -937,6 +945,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
 
     setDirectPrompt("");
     appendUserMessage(message);
+    setIsAwaitingModel(true);
     window.dispatchEvent(new CustomEvent("atoms-terminal-input", { detail: { data: `${message}\r` } }));
     lastAssistantMessageRef.current = null;
   }
@@ -1040,21 +1049,31 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
     }
   }
 
-  function appendUserMessage(content: string) {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  function appendUserMessages(texts: string[], isPending = false) {
+    const nextMessages = texts
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .map((content) => ({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        role: "user" as const,
+        category: "user" as const,
+        label: "You",
+        content,
+        createdAt: Date.now(),
+        isPending,
+      }));
+
+    if (!nextMessages.length) {
+      return;
+    }
+
     setTerminalMessages((current) =>
-      mergeConversationMessages(current, [
-        {
-          id,
-          role: "user" as const,
-          category: "user" as const,
-          label: "You",
-          content,
-          createdAt: Date.now(),
-          isPending: true,
-        },
-      ]).slice(-80),
+      mergeConversationMessages(current, nextMessages).slice(-80),
     );
+  }
+
+  function appendUserMessage(content: string) {
+    appendUserMessages([content], true);
   }
 
   function handleAssistantOutput(data: string, category: AgentMessageCategory = "assistant", label = "Model") {
@@ -1064,6 +1083,7 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
       return;
     }
 
+    setIsAwaitingModel(false);
     setTerminalMessages((current) => {
       const now = Date.now();
       const last = lastAssistantMessageRef.current;
@@ -1210,6 +1230,19 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
                     The agent is starting in the terminal. Chat will be available when it is ready.
                   </p>
                 ) : null}
+                {isAwaitingModel && (
+                  <article className="conversation-bubble conversation-bubble-assistant conversation-bubble-loading" aria-live="polite">
+                    <div className="conversation-bubble-meta">
+                      <MessageSquareText size={13} />
+                      <span>Model</span>
+                    </div>
+                    <div className="typing-indicator" aria-label="Model is responding">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                  </article>
+                )}
               </div>
               <form className="opencode-direct-form" onSubmit={sendDirectOpenCode}>
                 <div className="opencode-input-shell">
@@ -1434,11 +1467,13 @@ export function BuilderWorkspace({ user }: BuilderWorkspaceProps) {
             if (status === "closed" || status === "error") {
               setHookStatus("closed");
               setIsChatReady(false);
+              setIsAwaitingModel(false);
               return;
             }
 
             setHookStatus("connecting");
             setIsChatReady(false);
+            setIsAwaitingModel(false);
           }}
         />
       </section>
@@ -1622,7 +1657,7 @@ function mapStoredConversationMessage(message: StoredConversationMessage): Termi
   }
 
   if (message.role === "user") {
-    if (message.source !== "chat-input") {
+    if (!isVisibleUserConversationSource(message.source)) {
       return null;
     }
 
@@ -1652,6 +1687,10 @@ function mapStoredConversationMessage(message: StoredConversationMessage): Termi
     content,
     createdAt: parseConversationTime(message.createdAt),
   };
+}
+
+function isVisibleUserConversationSource(source?: string) {
+  return source === "chat-input" || source === "terminal-selection";
 }
 
 function mergeConversationMessages(
@@ -1802,5 +1841,3 @@ function parseSseChunk(chunk: string) {
     return null;
   }
 }
-
-
